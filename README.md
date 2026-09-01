@@ -1,24 +1,10 @@
-Where# KV Cache Compression Through the Lens of Transform Coding
+# KV Cache Compression Through the Lens of Transform Coding
 
 Reference implementation of **AATC (Attention-Aware Transform Coding)**.
 
 > **KV Cache Compression Through the Lens of Transform Coding**
 > Hannah Laus, Claudio Mayrink Verdun, Hao Wang, Flavio du Pin Calmon, Felix Krahmer
-> arXiv:2608.14191 — the PDF is included in this repository as `2608.14191v1.pdf`.
-
-The KV cache is the dominant memory cost of long-context LLM inference. Existing
-quantization methods lower precision *uniformly* and minimize reconstruction
-error on the cache itself, without accounting for how that error propagates
-through attention. We prove that under a white-noise quantization model the
-expected attention-aware distortion decomposes into additive key and value
-contributions that factor across tokens and channels (Theorem 1), and use the
-classical transform-coding recipe — decorrelate, then allocate by reverse
-water-filling — to spend a bit budget against *that* objective.
-
-On `Llama-3.1-8B-Instruct` and `Qwen-2.5-7B-Instruct`, evaluated across
-LongBench, RULER, GSM8K, MMLU-Pro and MATH-500, AATC is near-lossless at
-approximately 5.8x compression, whereas every baseline degrades on at least one
-benchmark.
+> [arXiv:2608.14191](https://arxiv.org/abs/2608.14191)
 
 ---
 
@@ -371,44 +357,70 @@ utils.py                                model loading and checkpoint dumping
 palu/                                   decomposed model implementation
                                         (Llama and Qwen variants, quantized
                                         cache modules, low-rank linear layers)
+                                        derived from shadowpa0327/Palu (MIT),
+                                        extended with the AATC quantizers
 longbench_utils/                        LongBench prompt formats and metrics,
                                         vendored from THUDM/LongBench (MIT)
 ```
 
----
+## Attribution and licensing
 
-## License
+This repository is released under the MIT License (see `LICENSE`). It vendors
+and builds on third-party code, listed below with its upstream source and
+license. Each vendored tree keeps a provenance note in its top-level module
+docstring as well.
 
-MIT — see [LICENSE](LICENSE). The `palu/` directory derives from
-[PALU](https://github.com/shadowpa0327/Palu) and `longbench_utils/` from
-[THUDM/LongBench](https://github.com/THUDM/LongBench), both MIT licensed.
+### `palu/` — derived from PALU (MIT)
 
----
+The decomposed-model implementation is derived from the official PALU
+release, <https://github.com/shadowpa0327/Palu>, which is MIT licensed.
+Retained largely as upstream: the head-wise low-rank linear layers, the
+whitening/SVD decomposition, the rank-search utilities, and the Llama and
+Qwen model plumbing.
+
+Written for this work and **not** part of upstream PALU:
+
+| File | Purpose |
+| --- | --- |
+| `palu/quantization_utils.py` | Loads the per-channel bitwidth allocations produced by `run_bit_allocation.py` |
+| `palu/model/svd_llama/adaptive_quantization_llama.py` | Sliding-window KV cache with attention sinks and staged requantization |
+| `palu/model/svd_qwen/adaptive_quantization_qwen.py` | The same, for Qwen |
+
+```bibtex
+@inproceedings{chang2024palu,
+  title={Palu: KV-cache compression with low-rank projection},
+  author={Chang, Chi-Chih and Lin, Wei-Cheng and Lin, Chien-Yu and Chen, Chong-Yan and Hu, Yu-Fang and Wang, Pei-Shuo and Huang, Ning-Chi and Ceze, Luis and Abdelfattah, Mohamed and Wu, Kai-Chiang},
+  booktitle={International Conference on Learning Representations},
+  volume={2025},
+  pages={50222--50249},
+  year={2025}
+}
+```
+
+### `longbench_utils/` — vendored from LongBench (MIT)
+
+Prompt templates, per-task generation lengths, and metric implementations are
+vendored from <https://github.com/THUDM/LongBench>, which is MIT licensed.
+Only the evaluation harness is vendored; the datasets themselves are pulled
+from the Hugging Face hub at run time via `load_dataset("THUDM/LongBench", ...)`.
+
+### Baselines
+
+`kvquant_cache.py` is a pure-PyTorch port of the simulated-quantization
+algorithm from <https://github.com/SqueezeAILab/KVQuant>. `kivi_cache.py` is
+an independent implementation of the KIVI algorithm rather than a port of the
+authors' code. RULER, `lm-evaluation-harness`, and `fast-hadamard-transform`
+are cloned at install time (see [Installation](#installation)) rather than
+vendored, and remain under their own licenses.
 
 ## Citation
 
 ```bibtex
-@misc{laus2026kvcache,
-      title={KV Cache Compression Through the Lens of Transform Coding},
-      author={Hannah Laus and Claudio Mayrink Verdun and Hao Wang and Flavio du Pin Calmon and Felix Krahmer},
-      year={2026},
-      eprint={2608.14191},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2608.14191},
+@article{laus2026aatc,
+  title={KV Cache Compression Through the Lens of Transform Coding},
+  author={Laus, Hannah and Verdun, Claudio Mayrink and Wang, Hao and Calmon, Flavio du Pin and Krahmer, Felix},
+  journal={arXiv preprint arXiv:2608.14191},
+  year={2026}
 }
 ```
 
-The decomposed-model implementation in `palu/` builds on PALU:
-
-```bibtex
-@misc{chang2024palucompressingkvcachelowrank,
-      title={Palu: Compressing KV-Cache with Low-Rank Projection},
-      author={Chi-Chih Chang and Wei-Cheng Lin and Chien-Yu Lin and Chong-Yan Chen and Yu-Fang Hu and Pei-Shuo Wang and Ning-Chi Huang and Luis Ceze and Kai-Chiang Wu},
-      year={2024},
-      eprint={2407.21118},
-      archivePrefix={arXiv},
-      primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2407.21118},
-}
-```
