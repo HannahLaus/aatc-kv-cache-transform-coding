@@ -406,12 +406,25 @@ from the Hugging Face hub at run time via `load_dataset("THUDM/LongBench", ...)`
 
 ### Baselines
 
-`kvquant_cache.py` is a pure-PyTorch port of the simulated-quantization
-algorithm from <https://github.com/SqueezeAILab/KVQuant>. `kivi_cache.py` is
-an independent implementation of the KIVI algorithm rather than a port of the
-authors' code. RULER, `lm-evaluation-harness`, and `fast-hadamard-transform`
-are cloned at install time (see [Installation](#installation)) rather than
-vendored, and remain under their own licenses.
+`kvquant_cache.py` is an independent reimplementation of the KVQuant method
+(<https://github.com/SqueezeAILab/KVQuant>) as a streaming HuggingFace
+`DynamicCache`, not a copy of the upstream file. Upstream has no
+`DynamicCache` integration; the cache class, the pre-RoPE un-rotate/re-rotate
+performed inside `update()`, the attention-sink handling, and the recent fp16
+residual window are written for this work. Two helpers *are* ported from
+upstream's `quant/kvquant/simquant_module_quantizer.py` and are marked as such
+in their docstrings: `build_nf_signposts` (the NormalFloat signpost
+construction) and `_nuq_recon` (NUQ reconstruction). `round_to_lut` and
+`_cap_outlier_mask` implement upstream behaviour by a different route — a
+bucketized `O(N log L)` nearest-signpost search, and a per-token fixed-count
+outlier policy in place of a magnitude threshold.
+
+`kivi_cache.py` is an independent implementation of the KIVI algorithm rather
+than a port of the authors' code.
+
+RULER, `lm-evaluation-harness`, and `fast-hadamard-transform` are cloned at
+install time (see [Installation](#installation)) rather than vendored, and
+remain under their own licenses.
 
 ## Citation
 
@@ -423,4 +436,5 @@ vendored, and remain under their own licenses.
   year={2026}
 }
 ```
+
 
