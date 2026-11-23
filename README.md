@@ -219,7 +219,7 @@ one for `palu` / `palu_uniform`. (`--palu_model` still works as an alias.)
 
 The paper's inference-time defaults for AATC: keep the first 4 tokens in full
 precision, a 128-token full-precision recent window with a sliding step of 16,
-and `G = 2` head groups for Llama (`G = 1` for Qwen).
+and `G = 2` head groups for Llama and Mistral-NeMo (`G = 1` for Qwen).
 
 ### LongBench — `run_longbench_comparison.py`
 
@@ -305,6 +305,96 @@ Beyond the shared flags: `--context_lengths`, `--ruler_repo_path`, `--tasks`,
 `run_ruler.py` is the underlying single-model RULER driver; the comparison
 script above calls into it and is what you want for reproducing the paper.
 
+### Mistral-NeMo
+
+The same pipeline runs on `mistralai/Mistral-Nemo-Instruct-2407` (40 layers,
+8 KV heads of dimension 128, so `G = 2` head groups as for Llama). Build the
+ratio-1.0 checkpoint, the RD statistics, the channel scales and the KVQuant
+quantizer exactly as in stages 1–4, with the model ID swapped:
+
+```bash
+python compress.py \
+    --model_id mistralai/Mistral-Nemo-Instruct-2407 \
+    --calib_dataset wikitext2 \
+    --param_ratio_target 1.0 \
+    --search_method fisher_uniform \
+    --decompose_method whiten \
+    --head_group_size 4 \
+    --dump_huggingface_model --use_cache
+
+python run_rd_calibration.py \
+    --model_path /Path/To/NeMo/Ratio-1.0/Model \
+    --dataset fineweb_openr1math \
+    --nsamples 256 --seqlen 2048 \
+    --output_path rd_stats_nemo.pt
+
+# 2.5 bits per element: first three layers at 2.5 (values) / 3.5 (keys)
+python run_bit_allocation.py \
+    --stats_path rd_stats_nemo.pt \
+    --compression_ratio 0.15625 \
+    --min_bits 0 --max_bits 16 \
+    --sigma2_normalization per_layer \
+    --w_normalization per_layer \
+    --protect_first_n_layers 3 \
+    --protect_bits_per_dim_v 2.5 --protect_bits_per_dim_k 3.5 \
+    --output_path bit_allocations_nemo.pt
+
+python run_channelwise_scaling_calibration.py \
+    --model_path /Path/To/NeMo/Ratio-1.0/Model \
+    --output_path fc_scale_nemo.pt
+
+python run_kvquant_calibration.py \
+    --model mistralai/Mistral-Nemo-Instruct-2407 \
+    --nbits 2 --output kvquant_q_nemo_2bit.pt
+```
+
+Evaluation uses the same scripts and method keys. All methods share the window
+of 4 full-precision sink tokens and 128 recent tokens:
+
+```bash
+# AATC
+CUDA_VISIBLE_DEVICES=0 python run_ruler_method_comparison.py \
+    --model mistralai/Mistral-Nemo-Instruct-2407 \
+    --transform_model /Path/To/NeMo/Ratio-1.0/Model \
+    --methods aatc \
+    --bitwidth_file bit_allocations_nemo.pt \
+    --scaling_type factored --channelwise_scaling_file fc_scale_nemo.pt \
+    --attention_sink_tokens 4 --recent_tokens 128 --sliding_step_size 16 \
+    --context_lengths 4096 8192 16384 32768 \
+    --ruler_repo_path /path/to/RULER \
+    --num_samples 500 --max_new_tokens 512 \
+    --output_dir results/nemo/ruler
+
+# Baseline, KIVI and KVQuant
+CUDA_VISIBLE_DEVICES=0 python run_ruler_method_comparison.py \
+    --model mistralai/Mistral-Nemo-Instruct-2407 \
+    --methods baseline kivi kvquant \
+    --kivi_bits 2 --attention_sink_tokens 4 \
+    --kvquant_bits 2 --kvquant_quantizer_file kvquant_q_nemo_2bit.pt \
+    --kvquant_sink_tokens 4 --kvquant_residual_length 128 --kvquant_group_size 32 \
+    --context_lengths 4096 8192 16384 32768 \
+    --ruler_repo_path /path/to/RULER \
+    --num_samples 500 --max_new_tokens 512 \
+    --output_dir results/nemo/ruler
+```
+
+Settings that differ from the script defaults and matter for Mistral-NeMo:
+
+- **RULER:** pass `--max_new_tokens 512`; the default of 50 cuts NeMo's answers
+  short.
+- **KVQuant:** pass `--kvquant_sink_tokens 4 --kvquant_residual_length 128`
+  (the defaults are 5 and 0) and a quantizer calibrated on NeMo at the same bit
+  width; a quantizer file from another model or bit width is refused.
+- **KIVI:** pass `--attention_sink_tokens 4` (default 0).
+- **MMLU-Pro:** run it separately from GSM8K / MATH-500 with its own output
+  directory: `--benchmarks mmlu_pro --mmlu_pro_subjects math computer_science
+  --limit 500`.
+- **Batch size:** the `aatc` and `palu_uniform` rows on GSM8K and MMLU-Pro use
+  `--batch_size 1`.
+
+The LongBench and reasoning scripts take the same flags as the RULER commands
+above.
+
 ### Generation demo — `run_generation_with_quantization.py`
 
 Single-prompt sanity check that the allocated bitwidths load and generate.
@@ -355,7 +445,7 @@ kv_effective_bits.py                    effective bits/element accounting
 utils.py                                model loading and checkpoint dumping
 
 palu/                                   decomposed model implementation
-                                        (Llama and Qwen variants, quantized
+                                        (Llama, Qwen and Mistral variants, quantized
                                         cache modules, low-rank linear layers)
                                         derived from shadowpa0327/Palu (MIT),
                                         extended with the AATC quantizers
@@ -375,8 +465,8 @@ docstring as well.
 The decomposed-model implementation is derived from the official PALU
 release, <https://github.com/shadowpa0327/Palu>, which is MIT licensed.
 Retained largely as upstream: the head-wise low-rank linear layers, the
-whitening/SVD decomposition, the rank-search utilities, and the Llama and
-Qwen model plumbing.
+whitening/SVD decomposition, the rank-search utilities, and the Llama, Qwen
+and Mistral model plumbing.
 
 Written for this work and **not** part of upstream PALU:
 
@@ -385,6 +475,8 @@ Written for this work and **not** part of upstream PALU:
 | `palu/quantization_utils.py` | Loads the per-channel bitwidth allocations produced by `run_bit_allocation.py` |
 | `palu/model/svd_llama/adaptive_quantization_llama.py` | Sliding-window KV cache with attention sinks and staged requantization |
 | `palu/model/svd_qwen/adaptive_quantization_qwen.py` | The same, for Qwen |
+
+Mistral-NeMo uses the Llama cache manager.
 
 ```bibtex
 @inproceedings{chang2024palu,
