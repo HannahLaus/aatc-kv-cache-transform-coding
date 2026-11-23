@@ -420,7 +420,7 @@ class PaluLlamaForCausalLM(LlamaForCausalLM):
     def get_kv_info(llama: LlamaForCausalLM, num_heads_in_lr_groups: int):
         num_lr_groups = llama.config.num_attention_heads // num_heads_in_lr_groups
         num_lr_kv_groups = llama.config.num_key_value_heads // num_heads_in_lr_groups
-        head_dim = llama.config.hidden_size // llama.config.num_attention_heads
+        head_dim = getattr(llama.config, "head_dim", None) or llama.config.hidden_size // llama.config.num_attention_heads
         lr_group_dims = head_dim * num_heads_in_lr_groups
         
         if num_lr_groups * num_heads_in_lr_groups != llama.config.num_attention_heads:

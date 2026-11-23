@@ -43,7 +43,7 @@ class PaluQwen2ForCausalLM(Qwen2ForCausalLM):
     def get_kv_info(qwen2: Qwen2ForCausalLM, num_heads_in_lr_groups: int):
         num_lr_groups = qwen2.config.num_attention_heads // num_heads_in_lr_groups
         num_lr_kv_groups = qwen2.config.num_key_value_heads // num_heads_in_lr_groups
-        head_dim = qwen2.config.hidden_size // qwen2.config.num_attention_heads
+        head_dim = getattr(qwen2.config, "head_dim", None) or qwen2.config.hidden_size // qwen2.config.num_attention_heads
         lr_group_dims = head_dim * num_heads_in_lr_groups
         
         if num_lr_groups * num_heads_in_lr_groups != qwen2.config.num_attention_heads:

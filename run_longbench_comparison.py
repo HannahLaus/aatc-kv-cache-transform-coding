@@ -166,7 +166,13 @@ def patch_kivi(model, args):
 
 def patch_kvquant(model, args):
     """Wrap model.generate to inject a fresh KVQuantizedCache per call."""
-    quantizer = load_quantizer(args.kvquant_quantizer_file)
+    quantizer = load_quantizer(args.kvquant_quantizer_file,
+                               expect_model=args.model,
+                               expect_nbits=args.kvquant_bits)
+    if quantizer is None:
+        print("  [KVQUANT-WARN] no --kvquant_quantizer_file: using uncalibrated "
+              "NormalFloat signposts, which is NOT KVQuant. Run "
+              "run_kvquant_calibration.py first.", flush=True)
     orig = model.generate
     def _kvquant_generate(*a, **kw):
         if "past_key_values" not in kw and "cache_implementation" not in kw:

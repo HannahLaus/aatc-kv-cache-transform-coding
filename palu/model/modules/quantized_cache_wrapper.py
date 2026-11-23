@@ -11,6 +11,72 @@ import os
 import torch
 from loguru import logger
 
+
+# ── Position ids for re-rotating cached keys ─────────────────────────────────
+# Cached keys are stored pre-RoPE and re-rotated on read. Until 2026-11-02 the
+# positions used were torch.arange(seq_len) broadcast over the batch, which is
+# only right when no row is padded. lm-eval batches generation requests with
+# LEFT padding, so a row with p pad tokens has query positions shifted by p
+# (HF derives position_ids from attention_mask), while its cached keys were
+# rotated at the unshifted positions: every key looked p tokens older than it
+# was and GSM8K collapsed (NeMo AATC 35.3 vs 75.7 baseline) while the batch-1
+# benchmarks were fine. The tracker below records the position_ids the base
+# model actually receives, per forward, and the two RoPE sites use them.
+
+def _install_position_tracker(model, qdc):
+    """Register one forward pre-hook on the base model that appends the
+    position_ids of each forward to ``model._qdc_position_buffer`` (batch, T).
+    Re-registering replaces the previous hook, so only the newest cache tracks."""
+    if model is None:
+        return
+    base = getattr(model, "model", model)
+    old = getattr(model, "_qdc_position_hook", None)
+    if old is not None:
+        try:
+            old.remove()
+        except Exception:
+            pass
+    model._qdc_position_buffer = None
+
+    def _hook(module, args, kwargs):
+        pos = kwargs.get("position_ids")
+        if pos is None or not torch.is_tensor(pos):
+            return None
+        pos = pos.detach()
+        if pos.dim() == 1:
+            pos = pos.unsqueeze(0)
+        buf = getattr(model, "_qdc_position_buffer", None)
+        # A forward on an empty cache is a new prompt: start a fresh buffer.
+        try:
+            fresh = qdc.get_seq_length() == 0
+        except Exception:
+            fresh = buf is None
+        if buf is None or fresh or buf.shape[0] != pos.shape[0]:
+            model._qdc_position_buffer = pos.clone()
+        else:
+            model._qdc_position_buffer = torch.cat([buf, pos.to(buf.device)], dim=1)
+        return None
+
+    try:
+        model._qdc_position_hook = base.register_forward_pre_hook(_hook, with_kwargs=True)
+    except TypeError:
+        # torch < 2.0 has no with_kwargs; fall back to arange positions.
+        model._qdc_position_hook = None
+
+
+def _cached_key_position_ids(model, batch: int, seq_len: int, device) -> torch.Tensor:
+    """Positions for the first ``seq_len`` cached keys of each row, from the
+    tracked position_ids when available, else torch.arange (the pre-fix
+    behaviour, exact for unpadded batches)."""
+    buf = getattr(model, "_qdc_position_buffer", None) if model is not None else None
+    if (buf is not None and buf.dim() == 2 and buf.shape[0] == batch
+            and buf.shape[1] >= seq_len):
+        return buf[:, :seq_len].to(device=device, dtype=torch.long)
+    pos = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+    if batch > 1:
+        pos = pos.expand(batch, -1)
+    return pos
+
 # Global flag to enable detailed cache debug logging in hot paths.
 _ADAPTIVE_DEBUG = os.environ.get("PALU_ADAPTIVE_DEBUG", "0") == "1"
 
@@ -281,7 +347,11 @@ class ReconstructingDict:
     def _apply_rope_to_cached_keys(self, key_states: torch.Tensor, layer_idx: int, seq_len: int) -> Optional[torch.Tensor]:
         """Apply RoPE to cached keys (positions 0..seq_len-1). Attention concats these with the new key; the new key gets RoPE in the attention layer, so cached keys must already have RoPE."""
         if not HAS_ROPE_UTILITY or self.model is None:
-            return key_states
+            raise RuntimeError(
+                f"[QuantizedDynamicCache] layer {layer_idx}: cannot re-rotate cached keys "
+                f"(HAS_ROPE_UTILITY={HAS_ROPE_UTILITY}, model={'set' if self.model is not None else 'None'}); "
+                "refusing to return un-rotated keys."
+            )
         # Use cached attention module to avoid repeated named_modules() traversal.
         attention_module = self._attention_modules.get(layer_idx)
         if attention_module is None:
@@ -297,9 +367,17 @@ class ReconstructingDict:
                 if attention_module is not None:
                     break
         if attention_module is None or not hasattr(attention_module, "rotary_emb"):
-            return key_states
+            # Never return un-rotated keys silently: attention would then mix RoPE'd new
+            # keys with raw cached keys and every run would be wrong with nothing failing.
+            # transformers >= 4.48 moved rotary_emb from the attention layer to the model;
+            # this project's supported window is 4.43 <= transformers < 4.48.
+            raise RuntimeError(
+                f"[QuantizedDynamicCache] layer {layer_idx}: attention module has no `rotary_emb`, "
+                "so cached keys cannot be re-rotated. transformers >= 4.48 removed the attention-level "
+                "rotary_emb; supported window is 4.43 <= transformers < 4.48 (cluster: 4.44.2)."
+            )
         device = key_states.device
-        position_ids = torch.arange(seq_len, device=device, dtype=torch.long).unsqueeze(0)
+        position_ids = _cached_key_position_ids(self.model, key_states.shape[0], seq_len, device)
         try:
             cos, sin = attention_module.rotary_emb(key_states, position_ids=position_ids)
         except (TypeError, ValueError):
@@ -343,14 +421,21 @@ class ReconstructingDict:
         """Return (layer_idx, value) pairs."""
         return [(layer_idx, self[layer_idx]) for layer_idx in self.keys()]
     
-    def _get_quantized_ba(self, layer_idx: int, debug_layer: bool = False, exclude_last_token: bool = False) -> Optional[torch.Tensor]:
+    def _get_quantized_ba(self, layer_idx: int, debug_layer: bool = False, exclude_last_token: bool = False,
+                          exclude_last_n: Optional[int] = None) -> Optional[torch.Tensor]:
         """Get quantized BA(x) for a specific layer.
-        
+
         Args:
             layer_idx: Layer index
             debug_layer: Whether to enable debug logging
             exclude_last_token: If True, return only previous tokens (excluding the last one).
                                If False, return the full sequence.
+            exclude_last_n: Drop the last N tokens instead of exactly one. Takes
+                            precedence over exclude_last_token. A caller that
+                            appends several tokens at once needs the prefix that
+                            preceded all of them, not just all-but-the-last.
+                            N >= seq_len yields an empty (0-token) tensor, which
+                            the caller reads as "nothing was cached".
         """
         key = (layer_idx, self.proj_type)
         if key not in self.layer_mapping:
@@ -1206,10 +1291,12 @@ class ReconstructingDict:
             # Reshape to (batch_size, num_heads, seq_len, head_dim)
             reconstructed_reshaped = reconstructed_ba.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
             
-            # If exclude_last_token is True, return only previous tokens (excluding the last one)
-            if exclude_last_token and seq_len > 0:
-                reconstructed_reshaped = reconstructed_reshaped[:, :, :-1, :]  # Exclude last token
-                # _get_quantized_ba logging removed for cleaner output
+            # Drop trailing tokens the caller already holds. exclude_last_n wins
+            # over the boolean; both collapse to "keep the first seq_len - n".
+            n_drop = exclude_last_n if exclude_last_n is not None else (1 if exclude_last_token else 0)
+            if n_drop and seq_len > 0:
+                keep = max(0, seq_len - int(n_drop))
+                reconstructed_reshaped = reconstructed_reshaped[:, :, :keep, :]
             
             # Reduced logging - only log on errors
             # if debug_layer:
@@ -1250,6 +1337,9 @@ class QuantizedDynamicCache(DynamicCache):
         
         self.quantized_cache = quantized_cache
         self.model = model
+        # Track the real per-row position ids so padded batches re-rotate
+        # cached keys at the positions the queries use (see _install_position_tracker).
+        _install_position_tracker(model, self)
         # Map layer_idx to (layer_name, proj_type) for k_proj and v_proj
         self._layer_mapping = {}
         
@@ -1411,14 +1501,20 @@ class QuantizedDynamicCache(DynamicCache):
         # Reconstruct full sequence for keys
         full_key_states = None
         if key_states is not None:
-            # Prompt phase: key_states has multiple tokens (e.g. 7). Return as-is — no concat with cache.
-            # Decode phase: key_states has 1 token. Get previous from cache (exclude_last_token) and concat.
+            # Ask the cache what preceded these tokens rather than inferring the
+            # phase from how many arrived. "More than one new token" only means
+            # "prefill" under generate(), where every later step carries exactly
+            # one. A caller that appends several tokens onto a populated cache —
+            # the forced-choice margin probe appends a multi-token suffix after
+            # prefilling the request — would take the prompt branch and silently
+            # drop the cached prefix, leaving attention with only the new tokens
+            # and a key/mask length mismatch.
             new_tokens_len = key_states.shape[2]
-            if new_tokens_len > 1:
+            previous_key_states_from_cache = self.key_cache._get_quantized_ba(
+                layer_idx, debug_layer=debug_layer, exclude_last_n=new_tokens_len)
+            if previous_key_states_from_cache is None or previous_key_states_from_cache.shape[2] == 0:
                 full_key_states = key_states
             else:
-                # Decode: 1 new token. Reconstruct previous from cache, apply RoPE, concat with new token.
-                previous_key_states_from_cache = self.key_cache._get_quantized_ba(layer_idx, debug_layer=debug_layer, exclude_last_token=True)
 
                 if previous_key_states_from_cache is None:
                     full_key_states = key_states
@@ -1430,7 +1526,9 @@ class QuantizedDynamicCache(DynamicCache):
                         attention_module = self._attention_modules.get(layer_idx)
                         if attention_module is not None and hasattr(attention_module, 'rotary_emb'):
                             prev_seq_len = previous_key_states_from_cache.shape[2]
-                            position_ids_prev = torch.arange(prev_seq_len, device=previous_key_states_from_cache.device).unsqueeze(0)
+                            position_ids_prev = _cached_key_position_ids(
+                                self.model, previous_key_states_from_cache.shape[0],
+                                prev_seq_len, previous_key_states_from_cache.device)
 
                             try:
                                 cos, sin = attention_module.rotary_emb(previous_key_states_from_cache, position_ids=position_ids_prev)
@@ -1468,31 +1566,42 @@ class QuantizedDynamicCache(DynamicCache):
                                         logger.error(traceback.format_exc())
                                     raise rope_error
                             else:
-                                full_key_states = torch.cat([previous_key_states_from_cache, key_states], dim=2)
+                                raise RuntimeError(
+                                    "[QuantizedDynamicCache] apply_rotary_pos_emb could not be imported from "
+                                    "transformers; refusing to concatenate un-rotated cached keys."
+                                )
                         else:
-                            full_key_states = torch.cat([previous_key_states_from_cache, key_states], dim=2)
+                            raise RuntimeError(
+                                f"[QuantizedDynamicCache] layer {layer_idx}: no attention-level `rotary_emb` "
+                                "found, cannot re-rotate cached keys. transformers >= 4.48 removed it; "
+                                "supported window is 4.43 <= transformers < 4.48 (cluster: 4.44.2)."
+                            )
+                    except RuntimeError:
+                        raise
                     except Exception as e:
-                        # Fallback: concatenate without RoPE
-                        full_key_states = torch.cat([previous_key_states_from_cache, key_states], dim=2)
+                        # Do NOT fall back to concatenating un-rotated keys: that runs to completion
+                        # with wrong attention and no error. Fail loudly instead.
+                        raise RuntimeError(
+                            f"[QuantizedDynamicCache] layer {layer_idx}: RoPE re-application to cached keys "
+                            f"failed ({type(e).__name__}: {e})"
+                        ) from e
 
         # Reconstruct previous tokens for values.
         # In LLaMA, values do NOT use RoPE (only keys and queries do), so no position-embedding fix is needed.
         # We must return the same sequence length as keys (cached_prev + new) so attention gets aligned K and V.
         full_value_states = None
         if value_states is not None:
-            # Prompt phase: value_states has multiple tokens — return as-is. Decode: 1 token — concat with cache.
+            # Same rule as the key side; values carry no RoPE.
             new_val_len = value_states.shape[2]
-            if new_val_len > 1:
+            previous_value_states_from_cache = self.value_cache._get_quantized_ba(
+                layer_idx, debug_layer=debug_layer, exclude_last_n=new_val_len)
+            if previous_value_states_from_cache is None or previous_value_states_from_cache.shape[2] == 0:
                 full_value_states = value_states
             else:
-                previous_value_states_from_cache = self.value_cache._get_quantized_ba(layer_idx, debug_layer=debug_layer, exclude_last_token=True)
-                if previous_value_states_from_cache is None:
-                    full_value_states = value_states
-                else:
-                    prev_v = previous_value_states_from_cache
-                    if prev_v.device != value_states.device or prev_v.dtype != value_states.dtype:
-                        prev_v = prev_v.to(device=value_states.device, dtype=value_states.dtype)
-                    full_value_states = torch.cat([prev_v, value_states], dim=2)
+                prev_v = previous_value_states_from_cache
+                if prev_v.device != value_states.device or prev_v.dtype != value_states.dtype:
+                    prev_v = prev_v.to(device=value_states.device, dtype=value_states.dtype)
+                full_value_states = torch.cat([prev_v, value_states], dim=2)
         
         # Ensure key and value sequence lengths match (required for correct attention)
         if full_key_states is not None and full_value_states is not None:
@@ -1537,12 +1646,20 @@ class QuantizedDynamicCache(DynamicCache):
         # Actually, let's NOT call the parent's update() because it might interfere with our logic.
         # Instead, we'll just return the values and let transformers use them directly.
         
-        # Track _seen_tokens like DynamicCache.update() does — some HF versions use this
-        # directly (not via get_seq_length()) for cache_position / causal mask computation.
-        # Without this, _seen_tokens stays at 0 and every decode token gets position 0.
-        if hasattr(self, '_seen_tokens') and layer_idx == 0:
-            if key_states is not None:
-                self._seen_tokens += key_states.shape[-2]
+        # Track the "tokens seen" counter like DynamicCache.update() does. Transformers
+        # reads it directly (NOT via get_seq_length()) in prepare_inputs_for_generation,
+        # to decide how much of input_ids is already cached. The attribute was renamed:
+        #   transformers <= 4.37:  public `seen_tokens`
+        #   transformers >= 4.38:  private `_seen_tokens`, `seen_tokens` a read-only property
+        # Guarding on one name only makes this a silent no-op on the other version: then
+        # past_length stays 0 while get_seq_length() reports the true length, generate
+        # re-feeds the whole prompt, and the causal mask stops matching the 2D attention
+        # mask ("The size of tensor a (T+1) must match the size of tensor b (2T+1)").
+        if layer_idx == 0 and key_states is not None:
+            n_new = key_states.shape[-2]
+            self._seen_tokens = getattr(self, "_seen_tokens", 0) + n_new
+            if not isinstance(getattr(type(self), "seen_tokens", None), property):
+                self.seen_tokens = self._seen_tokens
 
         # Return the FULL sequence (cached + new), not just the new token
         return (full_key_states, full_value_states)

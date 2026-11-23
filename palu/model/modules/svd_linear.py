@@ -2687,7 +2687,7 @@ class HeadwiseLowRankModule(nn.Module):
             new_module.U[i].weight.data = wl[i].contiguous()
             # Handle the cases where the bias is not None
             if old_module.bias is not None:
-                new_module.U[i].bias.data = b[i]
+                new_module.U[i].bias.data = b[i].clone()
 
         # load to VT
         # shape (sum(ranks), hidden_size)
@@ -2758,7 +2758,7 @@ class HeadwiseLowRankModule(nn.Module):
                 )
             new_module.U[g].weight.data = L_g.contiguous()
             if old_module.bias is not None:
-                new_module.U[g].bias.data = b[g]
+                new_module.U[g].bias.data = b[g].clone()
             R_list.append(R_g)
 
         VT_weight = torch.cat(R_list, dim=0).contiguous()
@@ -2813,7 +2813,7 @@ if _PALU_TORCH_COMPILE_ADAPTIVE and hasattr(torch, "compile"):
                 raise ValueError(f"{new_module.U[i].weight.data.shape} != {wl[i].shape}")
             new_module.U[i].weight.data = wl[i].contiguous()
             if old_module.bias is not None:
-                new_module.U[i].bias.data = b[i]
+                new_module.U[i].bias.data = b[i].clone()
         # load to VT
         # shape (sum(ranks), hidden_size)
         VT_weight = torch.cat(wr, dim=0).contiguous()

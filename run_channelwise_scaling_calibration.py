@@ -259,7 +259,7 @@ def run_channelwise_scaling_calibration(
                    f"max={scaling.max().item():.2e}, mean={scaling.mean().item():.2e}")
     
     # Save to cache
-    os.makedirs(os.path.dirname(cache_file), exist_ok=True)
+    os.makedirs(os.path.dirname(cache_file) or ".", exist_ok=True)
     torch.save(scalings, cache_file)
     logger.info(f"[Channelwise Scaling] Scalings saved to {cache_file}", fg="green")
     

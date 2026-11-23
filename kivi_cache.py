@@ -97,6 +97,18 @@ class KIVIQuantizedCache(DynamicCache):
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[-2]
+            # transformers <= 4.37 reads `seen_tokens` (public) in
+            # prepare_inputs_for_generation to decide how much of input_ids is
+            # already cached; 4.38+ renamed it to `_seen_tokens` and made
+            # `seen_tokens` a read-only property. DynamicCache.__init__ sets the
+            # public one to 0, and this subclass overrides update() without ever
+            # touching it, so on 4.37 past_length stays 0, input_ids are never
+            # trimmed, and the model builds a causal mask of (full_seq + cache)
+            # against a 2D mask of full_seq:
+            #   RuntimeError: The size of tensor a (75) must match ... (38)
+            # Mirror the counter when the name is a plain attribute.
+            if not isinstance(getattr(type(self), "seen_tokens", None), property):
+                self.seen_tokens = self._seen_tokens
             seq = key_states.shape[-2]
             if seq > 1 and not self._dbg_prefill_logged:
                 self._dbg_prefill_logged = True

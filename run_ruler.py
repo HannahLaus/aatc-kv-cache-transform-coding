@@ -276,6 +276,69 @@ def generate_response(
     return response.strip()
 
 
+# RULER pins english_words.json in git LFS; this is the raw object at the commit we use.
+ENGLISH_WORDS_LFS_URL = ("https://media.githubusercontent.com/media/NVIDIA/RULER/"
+                         "ab17b7853df4e0a30b78cd5d2b463ac7dff6ee13/scripts/data/synthetic/json/english_words.json")
+ENGLISH_WORDS_SHA256 = "affcd6d45fdf3cc843d585c99c97ad615094e760e6c4756b654bab6c73bc2eca"
+
+
+def _is_lfs_pointer(path: str) -> bool:
+    try:
+        if os.path.getsize(path) > 4096:
+            return False
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read(64).startswith("version https://git-lfs.github.com/spec/v1")
+    except OSError:
+        return False
+
+
+def _download_english_words(dest: str) -> bool:
+    """Fetch english_words.json from GitHub's LFS media endpoint; verify its sha256."""
+    import hashlib
+    import urllib.request
+    tmp = dest + ".part"
+    try:
+        urllib.request.urlretrieve(ENGLISH_WORDS_LFS_URL, tmp)
+        h = hashlib.sha256()
+        with open(tmp, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        if h.hexdigest() != ENGLISH_WORDS_SHA256:
+            logger.error(f"english_words.json download has unexpected sha256 {h.hexdigest()}")
+            os.remove(tmp)
+            return False
+        os.replace(tmp, dest)
+        logger.info(f"Downloaded english_words.json ({os.path.getsize(dest)} bytes) -> {dest}")
+        return True
+    except Exception as e:
+        logger.error(f"Downloading english_words.json failed: {e}")
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return False
+
+
+def resolve_hf_tokenizer_dir(model_id: str) -> Optional[str]:
+    """Return the local HF-cache snapshot directory holding model_id's tokenizer files.
+
+    Tries the cache first (no network); if absent, downloads only the tokenizer /
+    config files. Returns None if neither works.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        return None
+    patterns = ["tokenizer*", "*.json", "*.model", "*.txt", "*.tiktoken"]
+    for local_only in (True, False):
+        try:
+            path = snapshot_download(model_id, allow_patterns=patterns,
+                                     local_files_only=local_only)
+            if os.path.isdir(path) and any(f.startswith("tokenizer") for f in os.listdir(path)):
+                return os.path.abspath(path)
+        except Exception as e:
+            logger.debug(f"snapshot_download({model_id}, local_files_only={local_only}) failed: {e}")
+    return None
+
+
 def detect_model_template_type(model_path: str, tokenizer) -> str:
     """
     Detect the model template type based on model path or tokenizer.
@@ -524,8 +587,18 @@ def generate_ruler_samples(
         logger.warning(f"  cd {json_data_dir}")
         logger.warning(f"  wget http://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_distractor_v1.json -O hotpotqa.json")
     
-    # Check if english_words.json exists and is valid
+    # Check if english_words.json exists and is valid.
+    # RULER tracks this file with git LFS: a clone without git-lfs leaves a
+    # ~130-byte pointer ("version https://git-lfs.github.com/spec/v1 ...").
+    # Fetch the real object from GitHub's LFS media endpoint in that case.
     english_words_valid = False
+    if os.path.exists(english_words_file) and _is_lfs_pointer(english_words_file):
+        logger.warning(f"english_words.json is a git-lfs pointer, not the data (git-lfs not installed?). "
+                       f"Downloading the real file ...")
+        if not _download_english_words(english_words_file):
+            logger.error("Could not download english_words.json. Install git-lfs and run "
+                         f"`git -C {ruler_repo_path} lfs pull`, or fetch it manually:\n"
+                         f"  wget {ENGLISH_WORDS_LFS_URL} -O {english_words_file}")
     if os.path.exists(english_words_file):
         try:
             with open(english_words_file, 'r', encoding='utf-8') as f:
@@ -549,25 +622,8 @@ def generate_ruler_samples(
                         raise ValueError("english_words.json is not a valid dictionary")
         except (json.JSONDecodeError, ValueError) as e:
             logger.warning(f"english_words.json exists but is corrupted: {e}")
-            logger.info("Attempting to fix corrupted file...")
-            try:
-                # Try to fix common corruption issues
-                with open(english_words_file, 'r', encoding='utf-8') as f:
-                    content = f.read().strip()
-                
-                # Check if it's missing opening brace
-                if content.startswith('"') and not content.startswith('{'):
-                    logger.warning("File appears to be missing opening brace. This file may need to be re-downloaded.")
-                    logger.warning("The file should be a JSON object like: {\"1\": \"word1\", \"2\": \"word2\", ...}")
-                
-                # Remove corrupted file
-                os.remove(english_words_file)
-                logger.info(f"Removed corrupted english_words.json file")
-                logger.warning("You will need to restore this file for the 'cwe' task to work.")
-                logger.warning(f"Expected location: {english_words_file}")
-                logger.warning("This file should contain a JSON dictionary mapping numbers to English words.")
-            except Exception as fix_error:
-                logger.error(f"Failed to remove corrupted file: {fix_error}")
+            logger.warning(f"Leaving the file in place. Replace it with the real data:\n"
+                           f"  wget {ENGLISH_WORDS_LFS_URL} -O {english_words_file}")
     else:
         logger.warning(f"english_words.json not found at {english_words_file}")
     
@@ -1163,10 +1219,19 @@ def run_ruler_evaluation(
                     else:
                         abs_model_path = model_path
                     if not os.path.exists(abs_model_path):
-                        logger.warning(f"Model path does not exist locally: {abs_model_path}")
+                        logger.info(f"Model path is not a local directory ({model_path}); "
+                                    f"resolving tokenizer files for RULER's prepare.py ...")
                         if hasattr(tokenizer, "name_or_path") and os.path.exists(tokenizer.name_or_path):
                             abs_model_path = os.path.abspath(tokenizer.name_or_path)
                             logger.info(f"Using tokenizer name_or_path: {abs_model_path}")
+                        else:
+                            # Hub ID (e.g. mistralai/Mistral-Nemo-Instruct-2407): resolve the
+                            # local snapshot directory from the HF cache so RULER's prepare.py
+                            # gets a real directory of tokenizer files.
+                            resolved = resolve_hf_tokenizer_dir(model_path)
+                            if resolved:
+                                abs_model_path = resolved
+                                logger.info(f"Resolved Hub ID to local snapshot for RULER: {abs_model_path}")
 
                 generated = generate_ruler_samples(
                     ruler_repo_path=ruler_repo_path,

@@ -260,7 +260,13 @@ def patch_kvquant(model, args):
     active for the whole method iteration so KVQuant also covers the
     generate-based tasks (MATH-500, MMLU-Pro-gen).
     """
-    quantizer = load_quantizer(args.kvquant_quantizer_file)
+    quantizer = load_quantizer(args.kvquant_quantizer_file,
+                               expect_model=args.model,
+                               expect_nbits=args.kvquant_bits)
+    if quantizer is None:
+        print("  [KVQUANT-WARN] no --kvquant_quantizer_file: using uncalibrated "
+              "NormalFloat signposts, which is NOT KVQuant. Run "
+              "run_kvquant_calibration.py first.", flush=True)
     orig_generate = model.generate
 
     def _kvquant_generate(*a, **kw):
@@ -479,10 +485,19 @@ def _answers_equal(gold: str, model_answer: str) -> bool:
                 res = True
         return bool(res)
     except ImportError:
-        # math_verify not installed — fall back to normalised string match
-        logger.warning("math_verify not installed; using string match. "
-                       "Install with: pip install math-verify")
+        # math_verify not installed — fall back to normalised string match.
+        # Warn once per process (this is called 500 times per method).
+        if not _answers_equal._warned:
+            _answers_equal._warned = True
+            logger.warning("math_verify not installed; MATH-500 is scored by normalised "
+                           "string match (stricter than the paper's math_verify scorer). "
+                           "Per-sample records are saved as <method>_math500_records.json; "
+                           "rescore later with scripts/rescore_math500.py after "
+                           "pip install math-verify")
         return _normalize_answer(gold) == _normalize_answer(model_answer)
+
+
+_answers_equal._warned = False
 
 
 def load_math500(limit: Optional[int] = None) -> List[dict]:
@@ -647,8 +662,18 @@ def load_mmlu_pro_gen(subjects: Optional[List[str]] = None,
     test_ds = load_dataset(MMLU_PRO_GEN_DATASET, split="test")
     val_ds  = load_dataset(MMLU_PRO_GEN_DATASET, split="validation")
     if subjects:
-        test_ds = test_ds.filter(lambda x: x["category"] in subjects)
-        val_ds  = val_ds.filter(lambda x: x["category"] in subjects)
+        # CLI names follow lm-eval ("computer_science"); the TIGER-Lab dataset
+        # stores categories with spaces ("computer science").  Accept both.
+        wanted = {s.replace("_", " ").lower() for s in subjects}
+        available = {c.lower() for c in set(test_ds["category"])}
+        missing = sorted(wanted - available)
+        if missing:
+            raise ValueError(
+                f"MMLU-Pro subjects not found in {MMLU_PRO_GEN_DATASET}: {missing}. "
+                f"Available: {sorted(available)}"
+            )
+        test_ds = test_ds.filter(lambda x: x["category"].lower() in wanted)
+        val_ds  = val_ds.filter(lambda x: x["category"].lower() in wanted)
     if limit:
         test_ds = test_ds.select(range(min(limit, len(test_ds))))
     return list(test_ds), list(val_ds)
@@ -964,6 +989,18 @@ def main():
         # KVQuant: patch generate for the whole iteration (covers GSM8K, MATH-500,
         # MMLU-Pro-gen). MMLU-Pro is loglikelihood-scored, so the patch is a no-op there.
         kvquant_orig_generate = patch_kvquant(model, args) if method == "kvquant" else None
+        # KIVI: likewise patched for the whole iteration. Previously the patch
+        # lived inside the lm-eval block only, so MATH-500 / MMLU-Pro-gen ran
+        # KIVI *uncompressed*.
+        kivi_call_count = None
+        if method == "kivi":
+            kvquant_orig_generate, kivi_call_count = patch_kivi(model, args)
+            _resolved_res = (
+                args.kivi_residual_length if args.kivi_residual_length is not None
+                else (args.recent_tokens if args.recent_tokens > 0 else 128)
+            )
+            print(f"  KIVI: {args.kivi_bits}-bit, residual_length={_resolved_res} "
+                  f"(sink={args.attention_sink_tokens})", flush=True)
         if method == "kvquant":
             _q = "calibrated NUQ" if args.kvquant_quantizer_file else "NormalFloat (uncalibrated)"
             print(f"  KVQuant: {args.kvquant_bits}-bit, {_q}, "
@@ -990,16 +1027,7 @@ def main():
             # KIVI: KIVIQuantizedCache; palu sliding window: QuantizedDynamicCache.
             # MMLU-Pro is loglikelihood-scored (no generate call), so patches are no-ops there.
             orig_generate = None
-            kivi_call_count = None
-            if method == "kivi":
-                orig_generate, kivi_call_count = patch_kivi(model, args)
-                _resolved_res = (
-                    args.kivi_residual_length if args.kivi_residual_length is not None
-                    else (args.recent_tokens if args.recent_tokens > 0 else 128)
-                )
-                print(f"  KIVI: {args.kivi_bits}-bit, residual_length={_resolved_res} "
-                      f"(sink={args.attention_sink_tokens})", flush=True)
-            elif perdim_manager is not None:
+            if perdim_manager is not None:
                 orig_generate = patch_palu_qdc(model, perdim_manager)
                 logger.info(
                     f"  [sliding window] Patched model.generate with QuantizedDynamicCache "
@@ -1050,19 +1078,33 @@ def main():
 
         # ── MATH-500 custom evaluation ────────────────────────────────────────
         if run_math500_flag:
+            calls_before = kivi_call_count[0] if kivi_call_count is not None else None
             math_results = run_math500(model, tokenizer, args, manager=perdim_manager)
+            if calls_before is not None:
+                print(f"  [KIVI] model.generate calls during MATH-500: "
+                      f"{kivi_call_count[0] - calls_before}", flush=True)
             method_scores["math_500"] = math_results["accuracy"]
 
             out_path = output_dir / f"{method}_math500.json"
-            # Omit full generated texts from the summary JSON to keep it small
+            # Omit full generated texts from the summary JSON to keep it small;
+            # the per-sample records go to a sibling file so the run can be
+            # rescored (e.g. with math_verify) without regenerating.
             summary_results = {k: v for k, v in math_results.items() if k != "records"}
             with open(out_path, "w") as f:
                 json.dump(summary_results, f, indent=2)
             logger.info(f"  Saved MATH-500 results → {out_path}")
+            rec_path = output_dir / f"{method}_math500_records.json"
+            with open(rec_path, "w") as f:
+                json.dump(math_results.get("records", []), f, indent=1)
+            logger.info(f"  Saved MATH-500 per-sample records → {rec_path}")
 
         # ── MMLU-Pro generation-based evaluation ─────────────────────────────
         if run_mmlu_pro_gen_flag:
+            calls_before = kivi_call_count[0] if kivi_call_count is not None else None
             mpg_results = run_mmlu_pro_gen(model, tokenizer, args, manager=perdim_manager)
+            if calls_before is not None:
+                print(f"  [KIVI] model.generate calls during MMLU-Pro-gen: "
+                      f"{kivi_call_count[0] - calls_before}", flush=True)
             method_scores["mmlu_pro_gen"] = mpg_results["accuracy"]
 
             out_path = output_dir / f"{method}_mmlu_pro_gen.json"
@@ -1070,6 +1112,9 @@ def main():
             with open(out_path, "w") as f:
                 json.dump(summary_results, f, indent=2)
             logger.info(f"  Saved MMLU-Pro-gen results → {out_path}")
+            rec_path = output_dir / f"{method}_mmlu_pro_gen_records.json"
+            with open(rec_path, "w") as f:
+                json.dump(mpg_results.get("records", []), f, indent=1)
 
         all_scores[method] = method_scores
 

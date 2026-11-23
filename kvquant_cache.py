@@ -255,11 +255,17 @@ def quantize_values(v, lut, include_sparse, sparsity_threshold, dtype,
 _QUANTIZER_CACHE = {}
 
 
-def load_quantizer(path):
+def load_quantizer(path, expect_model=None, expect_nbits=None):
     """Load a calibrated quantizer ``.pt`` (from run_kvquant_calibration.py).
 
     Returns None for a falsy path (→ NormalFloat fallback).  Cached so the
     same file is only read from disk once per process.
+
+    expect_model / expect_nbits: when given, the file's recorded calibration
+    config must agree. The key thresholds are per (kv_head, head_dim) channel
+    of ONE checkpoint and the LUT holds 2**nbits signposts, so a file from
+    another model or bitwidth loads without a shape error and silently
+    produces garbage.
     """
     if not path:
         return None
@@ -267,6 +273,19 @@ def load_quantizer(path):
     if q is None:
         q = torch.load(path, map_location="cpu")
         _QUANTIZER_CACHE[path] = q
+    cfg = q.get("config", {}) if isinstance(q, dict) else {}
+    if expect_nbits is not None and cfg.get("nbits") not in (None, expect_nbits):
+        raise ValueError(
+            f"KVQuant quantizer {path} was calibrated at {cfg.get('nbits')} bits "
+            f"but --kvquant_bits is {expect_nbits}; recalibrate with --nbits {expect_nbits}.")
+    if expect_model is not None and cfg.get("model"):
+        a = str(cfg["model"]).rstrip("/").split("/")[-1].lower()
+        b = str(expect_model).rstrip("/").split("/")[-1].lower()
+        if a != b:
+            raise ValueError(
+                f"KVQuant quantizer {path} was calibrated on {cfg['model']} but the "
+                f"model being evaluated is {expect_model}; per-channel key thresholds "
+                f"do not transfer between checkpoints.")
     return q
 
 
@@ -429,6 +448,18 @@ class KVQuantizedCache(DynamicCache):
 
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[-2]
+            # transformers <= 4.37 reads `seen_tokens` (public) in
+            # prepare_inputs_for_generation to decide how much of input_ids is
+            # already cached; 4.38+ renamed it to `_seen_tokens` and made
+            # `seen_tokens` a read-only property. DynamicCache.__init__ sets the
+            # public one to 0, and this subclass overrides update() without ever
+            # touching it, so on 4.37 past_length stays 0, input_ids are never
+            # trimmed, and the model builds a causal mask of (full_seq + cache)
+            # against a 2D mask of full_seq:
+            #   RuntimeError: The size of tensor a (75) must match ... (38)
+            # Mirror the counter when the name is a plain attribute.
+            if not isinstance(getattr(type(self), "seen_tokens", None), property):
+                self.seen_tokens = self._seen_tokens
             seq = key_states.shape[-2]
             if self.pre_rope:  # accumulate cos/sin once per step (shared across layers)
                 self._cos = cos if self._cos is None else torch.cat([self._cos, cos], dim=1)

@@ -100,6 +100,11 @@ class PaluQwen2Attention(nn.Module):
         self.k_proj = inner.k_proj
         self.v_proj = inner.v_proj
         self.o_proj = inner.o_proj
+        if not hasattr(inner, "rotary_emb"):
+            raise RuntimeError(
+                f"[PaluQwen2Attention] layer {layer_idx}: {inner.__class__.__name__} has no `rotary_emb`. "
+                "transformers >= 4.48 moved it to the model; supported window is 4.43 <= transformers < 4.48."
+            )
         self.rotary_emb = inner.rotary_emb
 
     def forward(

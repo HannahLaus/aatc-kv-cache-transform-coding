@@ -29,6 +29,16 @@ Example
 
 import argparse
 import math
+import os
+
+# scikit-learn's KMeans (via OpenMP/OpenBLAS) opens one thread per core; on
+# large cluster nodes that exceeds OpenBLAS's compiled thread limit and aborts
+# ("Program is Terminated. Because you tried to allocate too many memory
+# regions").  Cap it before numpy/torch are imported.  Override with
+# KVQUANT_CALIB_THREADS if you want more.
+_n_threads = os.environ.get("KVQUANT_CALIB_THREADS", "16")
+for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
+    os.environ.setdefault(_var, _n_threads)
 
 import torch
 from datasets import load_dataset

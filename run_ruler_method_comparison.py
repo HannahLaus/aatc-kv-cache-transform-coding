@@ -279,7 +279,13 @@ def make_kivi_hook(args) -> callable:
 
 def make_kvquant_hook(args) -> callable:
     """Return a per-sample hook that creates a fresh KVQuantizedCache."""
-    quantizer = load_quantizer(args.kvquant_quantizer_file)
+    quantizer = load_quantizer(args.kvquant_quantizer_file,
+                               expect_model=args.model,
+                               expect_nbits=args.kvquant_bits)
+    if quantizer is None:
+        print("  [KVQUANT-WARN] no --kvquant_quantizer_file: using uncalibrated "
+              "NormalFloat signposts, which is NOT KVQuant. Run "
+              "run_kvquant_calibration.py first.", flush=True)
 
     def _hook():
         return KVQuantizedCache(
@@ -403,6 +409,14 @@ def main():
     ruler_repo = args.ruler_repo_path or RULER_REPO_PATH
     if not ruler_repo:
         parser.error("RULER repository not found. Use --ruler_repo_path or set RULER_REPO_PATH.")
+    ruler_repo = os.path.abspath(ruler_repo)
+    if not os.path.isdir(os.path.join(ruler_repo, "scripts", "data")):
+        parser.error(f"{ruler_repo} has no scripts/data: clone NVIDIA/RULER there "
+                     f"(git clone https://github.com/NVIDIA/RULER {ruler_repo}).")
+    for fname in ("english_words.json", "PaulGrahamEssays.json", "squad.json", "hotpotqa.json"):
+        fpath = os.path.join(ruler_repo, "scripts", "data", "synthetic", "json", fname)
+        if not os.path.exists(fpath):
+            logger.warning(f"RULER data file missing: {fpath}")
 
     needs_palu = [m for m in args.methods if m in ("palu_uniform", "aatc")]
     if needs_palu and args.transform_model is None:
